@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hwp2md"
+version = "1.1.0"
+description = "Standalone HWP and HWPX to Markdown and Microsoft Word (.docx) converter without Hancom Office dependency."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Unlicense"}
+authors = [
+    {name = "hwp2md developers"}
+]
+keywords = ["hwp", "hwpx", "markdown", "docx", "word", "converter", "hancom", "hangul", "table"]
+dependencies = [
+    "olefile>=0.46",
+    "pyhwp>=0.1b12",
+    "python-docx>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+hwp2md = "hwp2md.cli:main"
+hwp2docx = "hwp2md.cli:main_docx"
+
+[tool.setuptools.packages.find]
+include = ["hwp2md*"]
