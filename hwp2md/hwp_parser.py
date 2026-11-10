@@ -5,18 +5,19 @@ Extracts text, formatted runs, images, and converts tables into GFM or HTML tabl
 """
 
 from __future__ import annotations
+import io
 import os
 import re
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
+from contextlib import closing, redirect_stderr
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .table_builder import TableGrid
 
 try:
-    from contextlib import closing
     from hwp5.xmlmodel import Hwp5File
     from hwp5.hwp5html import HTMLTransform
     PYHWP_AVAILABLE = True
@@ -49,6 +50,7 @@ class HWPParser:
 
         self.bold_classes: Set[str] = set()
         self.italic_classes: Set[str] = set()
+        self.underline_classes: Set[str] = set()
         self.font_sizes: Dict[str, float] = {}
 
     def parse(self, output_md_path: Optional[str | Path] = None) -> str:
@@ -63,10 +65,11 @@ class HWPParser:
 
         temp_dir = tempfile.mkdtemp(prefix="hwp2md_")
         try:
-            # Transform HWP to XHTML directory with pyhwp
-            with closing(Hwp5File(str(self.hwp_path))) as hwp5file:
-                transformer = HTMLTransform()
-                transformer.transform_hwp5_to_dir(hwp5file, temp_dir)
+            # Transform HWP to XHTML directory with pyhwp (suppressing noisy internal warnings)
+            with redirect_stderr(io.StringIO()):
+                with closing(Hwp5File(str(self.hwp_path))) as hwp5file:
+                    transformer = HTMLTransform()
+                    transformer.transform_hwp5_to_dir(hwp5file, temp_dir)
 
             # Copy bindata images if enabled
             bindata_dir = Path(temp_dir) / "bindata"
@@ -105,7 +108,7 @@ class HWPParser:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _parse_css(self, css_text: str):
-        """Extract bold, italic, and font size properties from styles.css."""
+        """Extract bold, italic, underline, and font size properties from styles.css."""
         for match in re.finditer(r"(\.[a-zA-Z0-9_-]+)\s*\{([^}]+)\}", css_text):
             cls_name = match.group(1).lstrip(".")
             rules = match.group(2)
@@ -113,6 +116,8 @@ class HWPParser:
                 self.bold_classes.add(cls_name)
             if "font-style: italic" in rules:
                 self.italic_classes.add(cls_name)
+            if "text-decoration: underline" in rules:
+                self.underline_classes.add(cls_name)
             fs_match = re.search(r"font-size:\s*([\d\.]+)pt", rules)
             if fs_match:
                 try:
@@ -172,9 +177,9 @@ class HWPParser:
 
     def _parse_paragraph_details(
         self, p_elem: ET.Element
-    ) -> Tuple[List[Tuple[str, bool, bool]], List[str], float]:
-        """Extract inline runs, images, and max font size from a <p> element."""
-        runs: List[Tuple[str, bool, bool]] = []
+    ) -> Tuple[List[Tuple[str, bool, bool, bool]], List[str], float]:
+        """Extract inline runs (text, bold, italic, underline), images, and max font size from a <p> element."""
+        runs: List[Tuple[str, bool, bool, bool]] = []
         max_font_size = 10.0
         images: List[str] = []
 
@@ -196,31 +201,32 @@ class HWPParser:
             classes = node.attrib.get("class", "").split()
             is_bold = any(c in self.bold_classes for c in classes) or tag in ("b", "strong")
             is_italic = any(c in self.italic_classes for c in classes) or tag in ("i", "em")
+            is_underline = any(c in self.underline_classes for c in classes) or tag in ("u", "ins")
 
             for c in classes:
                 if c in self.font_sizes and self.font_sizes[c] > max_font_size:
                     max_font_size = self.font_sizes[c]
 
             if node.text:
-                runs.append((node.text, is_bold, is_italic))
+                runs.append((node.text, is_bold, is_italic, is_underline))
 
             for child in node:
                 walk_inline(child)
                 if child.tail:
-                    runs.append((child.tail, is_bold, is_italic))
+                    runs.append((child.tail, is_bold, is_italic, is_underline))
 
         walk_inline(p_elem)
 
         # Merge adjacent runs with identical styling
-        merged: List[Tuple[str, bool, bool]] = []
-        for text, b, it in runs:
+        merged: List[Tuple[str, bool, bool, bool]] = []
+        for text, b, it, u in runs:
             if not text:
                 continue
-            if merged and merged[-1][1:] == (b, it):
-                prev_text, prev_b, prev_it = merged[-1]
-                merged[-1] = (prev_text + text, prev_b, prev_it)
+            if merged and merged[-1][1:] == (b, it, u):
+                prev_text, prev_b, prev_it, prev_u = merged[-1]
+                merged[-1] = (prev_text + text, prev_b, prev_it, prev_u)
             else:
-                merged.append((text, b, it))
+                merged.append((text, b, it, u))
 
         return merged, images, max_font_size
 
@@ -230,7 +236,7 @@ class HWPParser:
 
         parts = []
         is_all_bold = True if merged else False
-        for text, b, it in merged:
+        for text, b, it, u in merged:
             if not b:
                 is_all_bold = False
             t = text.replace("\r", "").replace("\n", " ")
@@ -245,6 +251,9 @@ class HWPParser:
                         core = f"**{core}**"
                     if it:
                         core = f"*{core}*"
+                    if u:
+                        core = f"<u>{core}</u>"
+                    parts.append(f"{lead}{core}{trail}")
                     parts.append(f"{lead}{core}{trail}")
 
         full_text = " ".join("".join(parts).split())
@@ -368,9 +377,10 @@ class HWPParser:
         temp_dir = tempfile.mkdtemp(prefix="hwp2md_")
 
         try:
-            with closing(Hwp5File(str(self.hwp_path))) as hwp5file:
-                transformer = HTMLTransform()
-                transformer.transform_hwp5_to_dir(hwp5file, temp_dir)
+            with redirect_stderr(io.StringIO()):
+                with closing(Hwp5File(str(self.hwp_path))) as hwp5file:
+                    transformer = HTMLTransform()
+                    transformer.transform_hwp5_to_dir(hwp5file, temp_dir)
 
             bindata_dir = Path(temp_dir) / "bindata"
             if self.extract_images and bindata_dir.exists() and any(bindata_dir.iterdir()):
@@ -450,11 +460,11 @@ class HWPParser:
         if not merged:
             return
 
-        clean_text = " ".join("".join(t for t, _, _ in merged).split())
+        clean_text = " ".join("".join(t for t, _, _, _ in merged).split())
         if not clean_text:
             return
 
-        is_all_bold = all(b for _, b, _ in merged)
+        is_all_bold = all(b for _, b, _, _ in merged)
         if max_font_size >= 18.0 and len(clean_text) < 100:
             builder.add_heading(clean_text, level=1)
         elif max_font_size >= 15.0 and len(clean_text) < 120:
@@ -462,8 +472,8 @@ class HWPParser:
         elif max_font_size >= 13.0 and is_all_bold and len(clean_text) < 120:
             builder.add_heading(clean_text, level=3)
         else:
-            runs_4 = [(t, b, it, False) for t, b, it in merged]
-            builder.add_paragraph_runs(runs_4)
+            runs_5 = [(t, b, it, False, u) for t, b, it, u in merged]
+            builder.add_paragraph_runs(runs_5)
 
 
 def convert_hwp(

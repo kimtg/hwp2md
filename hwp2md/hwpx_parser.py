@@ -207,7 +207,8 @@ class HWPXParser:
                 bold = cp.get("bold", False)
                 italic = cp.get("italic", False)
                 strikeout = cp.get("strikeout", False)
-                raw_runs.append((run_text, bold, italic, strikeout))
+                underline = cp.get("underline", False)
+                raw_runs.append((run_text, bold, italic, strikeout, underline))
 
         # Merge adjacent runs with identical formatting for clean markdown output
         merged_runs = self._merge_runs(raw_runs)
@@ -215,10 +216,12 @@ class HWPXParser:
         formatted_parts: List[str] = []
         is_all_bold = True if merged_runs else False
 
-        for text, bold, italic, strikeout in merged_runs:
+        for text, bold, italic, strikeout, underline in merged_runs:
             if not bold:
                 is_all_bold = False
-            part = self._apply_inline_formatting(text, bold=bold, italic=italic, strikeout=strikeout)
+            part = self._apply_inline_formatting(
+                text, bold=bold, italic=italic, strikeout=strikeout, underline=underline
+            )
             formatted_parts.append(part)
 
         paragraph_text = "".join(formatted_parts).strip()
@@ -242,18 +245,20 @@ class HWPXParser:
         return "\n\n".join(result_parts)
 
     def _merge_runs(
-        self, runs: List[Tuple[str, bool, bool, bool]]
-    ) -> List[Tuple[str, bool, bool, bool]]:
+        self, runs: List[Tuple[str, ...]]
+    ) -> List[Tuple[str, ...]]:
         """Merge adjacent runs that share identical formatting."""
-        merged: List[Tuple[str, bool, bool, bool]] = []
-        for text, bold, italic, strikeout in runs:
+        merged: List[Tuple[str, ...]] = []
+        for item in runs:
+            text = item[0]
+            fmt = item[1:]
             if not text:
                 continue
-            if merged and merged[-1][1:] == (bold, italic, strikeout):
-                prev_text, b, it, s = merged[-1]
-                merged[-1] = (prev_text + text, b, it, s)
+            if merged and merged[-1][1:] == fmt:
+                prev_text = merged[-1][0]
+                merged[-1] = (prev_text + text, *fmt)
             else:
-                merged.append((text, bold, italic, strikeout))
+                merged.append((text, *fmt))
         return merged
 
     def _extract_text_from_t(self, t_elem: ET.Element) -> str:
@@ -274,12 +279,17 @@ class HWPXParser:
         return "".join(parts)
 
     def _apply_inline_formatting(
-        self, text: str, bold: bool = False, italic: bool = False, strikeout: bool = False
+        self,
+        text: str,
+        bold: bool = False,
+        italic: bool = False,
+        strikeout: bool = False,
+        underline: bool = False,
     ) -> str:
-        """Apply bold/italic/strikeout markdown formatting preserving leading/trailing whitespace."""
+        """Apply bold/italic/strikeout/underline markdown formatting preserving leading/trailing whitespace."""
         if not text:
             return ""
-        if not (bold or italic or strikeout):
+        if not (bold or italic or strikeout or underline):
             return text
 
         match = re.match(r"^(\s*)(.*?)(\s*)$", text, flags=re.DOTALL)
@@ -289,6 +299,8 @@ class HWPXParser:
         if not core:
             return text
 
+        if underline:
+            core = f"<u>{core}</u>"
         if strikeout:
             core = f"~~{core}~~"
         if bold:
@@ -371,11 +383,12 @@ class HWPXParser:
                     bold = cp.get("bold", False)
                     italic = cp.get("italic", False)
                     strikeout = cp.get("strikeout", False)
-                    raw_runs.append((run_text, bold, italic, strikeout))
+                    underline = cp.get("underline", False)
+                    raw_runs.append((run_text, bold, italic, strikeout, underline))
 
             merged = self._merge_runs(raw_runs)
-            for t, b, it, s in merged:
-                part = self._apply_inline_formatting(t, bold=b, italic=it, strikeout=s)
+            for t, b, it, s, u in merged:
+                part = self._apply_inline_formatting(t, bold=b, italic=it, strikeout=s, underline=u)
                 if part:
                     line_parts.append(part)
 
@@ -512,7 +525,8 @@ class HWPXParser:
                 bold = cp.get("bold", False)
                 italic = cp.get("italic", False)
                 strikeout = cp.get("strikeout", False)
-                raw_runs.append((run_text, bold, italic, strikeout))
+                underline = cp.get("underline", False)
+                raw_runs.append((run_text, bold, italic, strikeout, underline))
 
         # Add images
         for img in images:
@@ -522,8 +536,8 @@ class HWPXParser:
             return
 
         merged_runs = self._merge_runs(raw_runs)
-        is_all_bold = all(b for _, b, _, _ in merged_runs)
-        clean_text = "".join(t for t, _, _, _ in merged_runs).strip()
+        is_all_bold = all(item[1] for item in merged_runs)
+        clean_text = "".join(item[0] for item in merged_runs).strip()
 
         if not clean_text:
             return

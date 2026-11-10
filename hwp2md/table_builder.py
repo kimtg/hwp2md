@@ -186,3 +186,21 @@ class TableGrid:
             lines.append("  </tr>")
         lines.append("</table>")
         return "\n".join(lines)
+
+    def to_text(self) -> str:
+        """
+        Convert table to plain text with tab-separated columns and newline-separated rows.
+        Ideal for LLM processing, RAG indexing, and search.
+        """
+        if self.is_empty():
+            return ""
+
+        rows: List[str] = []
+        for r in range(self.num_rows):
+            cells = []
+            for c in range(self.num_cols):
+                raw = self.grid[r][c].replace("<br>", " ").replace("\\|", "|").strip()
+                cells.append(raw)
+            if any(c for c in cells):
+                rows.append("\t".join(cells))
+        return "\n".join(rows)

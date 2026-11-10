@@ -1,24 +1,33 @@
 """
-Command-line interface (CLI) for hwp2md and hwp2docx.
+Command-line interface (CLI) for hwp2md, hwp2docx, and hwp2txt.
 """
 
 from __future__ import annotations
 import argparse
 import glob
+import json
 import sys
 from pathlib import Path
 from typing import List, Optional
 
-from .converter import convert, convert_to_docx, detect_format
+from .converter import convert, convert_to_docx, convert_to_text, get_metadata, detect_format
 from . import __version__
 
 
-def parse_args(args: List[str] = None, default_to_docx: bool = False) -> argparse.Namespace:
-    prog_name = "hwp2docx" if default_to_docx else "hwp2md"
+def parse_args(
+    args: List[str] = None,
+    default_mode: str = "md",
+) -> argparse.Namespace:
+    prog_map = {
+        "docx": "hwp2docx",
+        "txt": "hwp2txt",
+        "md": "hwp2md",
+    }
+    prog_name = prog_map.get(default_mode, "hwp2md")
+
     desc = (
-        "Convert HWP / HWPX documents to Microsoft Word (.docx) without Hancom Office dependency."
-        if default_to_docx
-        else "Convert HWP / HWPX documents to Markdown (.md) or Microsoft Word (.docx) without Hancom Office dependency."
+        f"Convert HWP / HWPX documents to Markdown (.md), Microsoft Word (.docx), or plain text (.txt) "
+        f"without Hancom Office or MS Office dependency."
     )
 
     parser = argparse.ArgumentParser(
@@ -36,23 +45,15 @@ Examples:
   hwp2md document.hwp -o report.docx
   hwp2docx document.hwpx
 
-  # Specify output file
-  hwp2md report.hwpx -o output.md
+  # Extract clean plain text for LLM / RAG
+  hwp2md document.hwpx --text
+  hwp2txt document.hwpx
 
-  # Convert all files in current folder to Word (.docx)
-  hwp2md *.hwpx --docx
+  # Inspect document metadata
+  hwp2md document.hwpx --meta
 
   # Convert entire directory recursively
-  hwp2md ./documents/ -r
-
-  # Convert with single-cell boxes as blockquotes
-  hwp2md document.hwpx --box-style quote
-
-  # Convert tables as HTML for maximum layout preservation (Markdown mode)
-  hwp2md document.hwpx --table-format html
-
-  # Disable image extraction
-  hwp2md document.hwpx --no-images
+  hwp2md ./documents/ -r --docx
 """,
     )
 
@@ -64,19 +65,30 @@ Examples:
     parser.add_argument(
         "-o",
         "--output",
-        help="Output file or directory. If extension is .docx, automatically converts to Word.",
+        help="Output file or directory. Extension (.docx, .txt, .md) determines format automatically.",
     )
     parser.add_argument(
         "--docx",
         action="store_true",
-        default=default_to_docx,
-        help="Convert to Microsoft Word (.docx) format instead of Markdown.",
+        default=(default_mode == "docx"),
+        help="Convert to Microsoft Word (.docx) format.",
+    )
+    parser.add_argument(
+        "--text",
+        action="store_true",
+        default=(default_mode == "txt"),
+        help="Extract clean plain text (.txt) for LLM / RAG pipelines.",
+    )
+    parser.add_argument(
+        "--meta",
+        action="store_true",
+        help="Display document metadata in JSON format and exit.",
     )
     parser.add_argument(
         "--format",
-        choices=["md", "markdown", "docx"],
-        default="docx" if default_to_docx else None,
-        help="Explicitly set output format: 'md' (Markdown) or 'docx' (Word).",
+        choices=["md", "markdown", "docx", "txt", "text"],
+        default=default_mode if default_mode != "md" else None,
+        help="Explicitly set output format: 'md', 'docx', or 'txt'.",
     )
     parser.add_argument(
         "--table-format",
@@ -108,7 +120,7 @@ Examples:
     parser.add_argument(
         "--stdout",
         action="store_true",
-        help="Print converted markdown directly to standard output (Markdown mode only).",
+        help="Print converted text/markdown directly to standard output.",
     )
     parser.add_argument(
         "-v",
@@ -135,7 +147,6 @@ def collect_files(input_patterns: List[str], recursive: bool = False) -> List[Pa
                         seen.add(f.resolve())
                         matched_files.append(f)
         else:
-            # Handle glob patterns or exact files
             expanded = glob.glob(pattern, recursive=recursive)
             if not expanded and p.exists():
                 expanded = [str(p)]
@@ -150,31 +161,47 @@ def collect_files(input_patterns: List[str], recursive: bool = False) -> List[Pa
     return matched_files
 
 
-def run_cli(args: List[str] = None, default_to_docx: bool = False) -> int:
-    parsed = parse_args(args, default_to_docx=default_to_docx)
+def run_cli(args: List[str] = None, default_mode: str = "md") -> int:
+    parsed = parse_args(args, default_mode=default_mode)
     files = collect_files(parsed.inputs, recursive=parsed.recursive)
 
     if not files:
         print("[!] No .hwp or .hwpx files found matching input patterns.", file=sys.stderr)
         return 1
 
-    # Determine if docx mode
-    is_docx = (
-        parsed.docx
-        or parsed.format == "docx"
-        or (parsed.output and Path(parsed.output).suffix.lower() == ".docx")
-    )
+    # Metadata mode
+    if parsed.meta:
+        meta_list = [get_metadata(f) for f in files]
+        print(json.dumps(meta_list if len(meta_list) > 1 else meta_list[0], indent=2, ensure_ascii=False))
+        return 0
+
+    # Determine mode
+    out_ext = Path(parsed.output).suffix.lower() if parsed.output else ""
+    is_docx = parsed.docx or parsed.format == "docx" or out_ext == ".docx"
+    is_text = parsed.text or parsed.format in ("txt", "text") or out_ext == ".txt"
+
+    if is_text:
+        target_ext = ".txt"
+    elif is_docx:
+        target_ext = ".docx"
+    else:
+        target_ext = ".md"
 
     if is_docx and parsed.stdout:
         print("[!] --stdout is not supported for binary .docx output. Generating file instead.", file=sys.stderr)
         parsed.stdout = False
 
-    target_ext = ".docx" if is_docx else ".md"
     success_count = 0
     fail_count = 0
+    total = len(files)
 
-    for file_path in files:
+    for idx, file_path in enumerate(files, 1):
         try:
+            if total > 1 and not parsed.stdout:
+                prefix = f"[{idx}/{total}] "
+            else:
+                prefix = ""
+
             # Determine output destination
             if parsed.stdout:
                 out_path = None
@@ -196,16 +223,17 @@ def run_cli(args: List[str] = None, default_to_docx: bool = False) -> int:
                 table_format=parsed.table_format,
                 box_style=parsed.box_style,
                 to_docx=is_docx,
+                to_text=is_text,
             )
 
             if parsed.stdout:
                 sys.stdout.write(str(result))
             else:
                 dest_name = out_path.name if out_path else str(result)
-                print(f"[✓] Converted: {file_path.name} -> {dest_name}")
+                print(f"{prefix}[✓] Converted: {file_path.name} -> {dest_name}")
             success_count += 1
         except Exception as e:
-            print(f"[✗] Failed to convert {file_path.name}: {e}", file=sys.stderr)
+            print(f"{prefix}[✗] Failed to convert {file_path.name}: {e}", file=sys.stderr)
             fail_count += 1
 
     if not parsed.stdout and len(files) > 1:
@@ -215,11 +243,15 @@ def run_cli(args: List[str] = None, default_to_docx: bool = False) -> int:
 
 
 def main(args: List[str] = None) -> int:
-    return run_cli(args, default_to_docx=False)
+    return run_cli(args, default_mode="md")
 
 
 def main_docx(args: List[str] = None) -> int:
-    return run_cli(args, default_to_docx=True)
+    return run_cli(args, default_mode="docx")
+
+
+def main_text(args: List[str] = None) -> int:
+    return run_cli(args, default_mode="txt")
 
 
 if __name__ == "__main__":

@@ -79,3 +79,6 @@ ehthumbs_vista.db
 *_images/
 test_out.*
 *.tmp
+sample/*.md
+sample/*.docx
+sample/*.txt

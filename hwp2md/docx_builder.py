@@ -1,6 +1,7 @@
 """
 DocxBuilder module for converting parsed HWP/HWPX documents into Microsoft Word (.docx).
-Maintains typography, font styles, headings, tables with rowspan/colspan, and images.
+Maintains typography, font styles, headings, tables with rowspan/colspan, images,
+hyperlinks, and advanced callout boxes.
 """
 
 from __future__ import annotations
@@ -16,21 +17,28 @@ try:
     from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
     from docx.oxml import OxmlElement, parse_xml
     from docx.oxml.ns import nsdecls, qn
+    import docx.opc.constants
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
 
-from .table_builder import TableGrid
+from .table_builder import TableGrid, get_east_asian_width
+
+# XML Namespaces
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
 def parse_inline_markdown(text: str) -> List[Tuple[str, str, Optional[str]]]:
     """
     Parse inline markdown tokens from text:
     Returns list of (token_type, content, extra)
-    token_type can be: 'text', 'bold', 'italic', 'strike', 'image'
+    token_type can be: 'text', 'bold', 'italic', 'strike', 'underline', 'image', 'link'
     """
     pattern = re.compile(
         r'(!\[.*?\]\(.*?\))|'
+        r'(\[.*?\]\(.*?\))|'
+        r'(<u>.*?</u>)|'
         r'(\*\*.*?\*\*)|'
         r'(\*.*?\*)|'
         r'(~~.*?~~)'
@@ -49,6 +57,13 @@ def parse_inline_markdown(text: str) -> List[Tuple[str, str, Optional[str]]]:
             img_match = re.match(r'!\[(.*?)\]\((.*?)\)', token_str)
             if img_match:
                 tokens.append(('image', img_match.group(1), img_match.group(2)))
+        elif token_str.startswith('['):
+            link_match = re.match(r'\[(.*?)\]\((.*?)\)', token_str)
+            if link_match:
+                tokens.append(('link', link_match.group(1), link_match.group(2)))
+        elif token_str.startswith('<u>'):
+            inner = token_str[3:-4].replace(r"\|", "|")
+            tokens.append(('underline', inner, None))
         elif token_str.startswith('**'):
             inner = token_str[2:-2].replace(r"\|", "|")
             tokens.append(('bold', inner, None))
@@ -66,6 +81,31 @@ def parse_inline_markdown(text: str) -> List[Tuple[str, str, Optional[str]]]:
         tokens.append(('text', raw_text.replace(r"\|", "|"), None))
 
     return tokens
+
+
+def add_hyperlink_to_paragraph(paragraph, url: str, text: str, color_hex: str = "1D4ED8"):
+    """Insert a clickable external hyperlink into a python-docx paragraph."""
+    part = paragraph.part
+    try:
+        r_id = part.relate_to(url, docx.opc.constants.RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+        hyperlink_xml = (
+            f'<w:hyperlink xmlns:w="{W_NS}" xmlns:r="{R_NS}" r:id="{r_id}">'
+            f'  <w:r>'
+            f'    <w:rPr>'
+            f'      <w:rFonts w:eastAsia="맑은 고딕"/>'
+            f'      <w:color w:val="{color_hex}"/>'
+            f'      <w:u w:val="single"/>'
+            f'    </w:rPr>'
+            f'    <w:t>{text}</w:t>'
+            f'  </w:r>'
+            f'</w:hyperlink>'
+        )
+        paragraph._p.append(parse_xml(hyperlink_xml))
+    except Exception:
+        # Fallback to plain formatted run
+        run = paragraph.add_run(f"{text} ({url})")
+        run.font.name = "맑은 고딕"
+        run.underline = True
 
 
 class DocxBuilder:
@@ -142,28 +182,41 @@ class DocxBuilder:
 
     def add_paragraph_runs(
         self,
-        runs: List[Tuple[str, bool, bool, bool]],
+        runs: List[Union[Tuple[str, bool, bool], Tuple[str, bool, bool, bool], Tuple[str, bool, bool, bool, bool]]],
         is_heading: bool = False,
         heading_level: int = 1,
     ):
-        """Add a paragraph constructed from raw (text, bold, italic, strikeout) runs."""
+        """
+        Add a paragraph constructed from raw runs.
+        Supports 3-tuple (text, bold, italic),
+                 4-tuple (text, bold, italic, strikeout),
+                 or 5-tuple (text, bold, italic, strikeout, underline).
+        """
         if not runs:
             return
 
         if is_heading:
-            full_text = "".join(t for t, _, _, _ in runs)
+            full_text = "".join(item[0] for item in runs)
             self.add_heading(full_text, level=heading_level)
             return
 
         p = self.doc.add_paragraph()
-        for text, bold, italic, strikeout in runs:
+        for item in runs:
+            text = item[0]
             if not text:
                 continue
+            bold = item[1] if len(item) > 1 else False
+            italic = item[2] if len(item) > 2 else False
+            strikeout = item[3] if len(item) > 3 else False
+            underline = item[4] if len(item) > 4 else False
+
             run = p.add_run(text)
             run.bold = bold
             run.italic = italic
             if strikeout:
                 run.font.strike = True
+            if underline:
+                run.underline = True
             run.font.name = "맑은 고딕"
 
     def add_markdown_paragraph(self, text: str, base_dir: Optional[Path] = None):
@@ -226,8 +279,14 @@ class DocxBuilder:
                 run = paragraph.add_run(content)
                 run.font.strike = True
                 run.font.name = "맑은 고딕"
+            elif token_type == "underline":
+                run = paragraph.add_run(content)
+                run.underline = True
+                run.font.name = "맑은 고딕"
+            elif token_type == "link":
+                url = extra or ""
+                add_hyperlink_to_paragraph(paragraph, url=url, text=content)
             elif token_type == "image":
-                alt_text = content
                 img_path_str = extra or ""
                 self._insert_image_to_paragraph(
                     paragraph,
@@ -258,7 +317,6 @@ class DocxBuilder:
                 break
 
         if not found_path:
-            # Fallback to text label if image file not on disk
             run = paragraph.add_run(f"[{image_path_str}]")
             run.italic = True
             return
@@ -287,6 +345,45 @@ class DocxBuilder:
         p.paragraph_format.space_after = Pt(6)
         self._insert_image_to_paragraph(p, str(image_path), max_width_inches=max_width_inches)
 
+    def _add_callout_box(self, text: str, base_dir: Optional[Path] = None):
+        """Render a 1x1 callout box with light shaded background and an accent left border."""
+        tbl = self.doc.add_table(rows=1, cols=1)
+        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        cell = tbl.cell(0, 0)
+        cell.width = Inches(6.8)
+
+        # Style borders and shading: Left thick border, subtle light gray background
+        tcPr = cell._tc.get_or_add_tcPr()
+        shd_xml = f'<w:shd xmlns:w="{W_NS}" w:val="clear" w:color="auto" w:fill="F8FAFC"/>'
+        tcPr.append(parse_xml(shd_xml))
+
+        borders_xml = (
+            f'<w:tcBorders xmlns:w="{W_NS}">'
+            f'  <w:top w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>'
+            f'  <w:left w:val="single" w:sz="24" w:space="0" w:color="2563EB"/>'
+            f'  <w:bottom w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>'
+            f'  <w:right w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>'
+            f'</w:tcBorders>'
+        )
+        tcPr.append(parse_xml(borders_xml))
+
+        # Internal cell margins (padding)
+        mar_xml = (
+            f'<w:tcMar xmlns:w="{W_NS}">'
+            f'  <w:top w:w="120" w:type="dxa"/>'
+            f'  <w:left w:w="180" w:type="dxa"/>'
+            f'  <w:bottom w:w="120" w:type="dxa"/>'
+            f'  <w:right w:w="180" w:type="dxa"/>'
+            f'</w:tcMar>'
+        )
+        tcPr.append(parse_xml(mar_xml))
+
+        self._populate_cell(cell, text, base_dir=base_dir)
+
+        spacer = self.doc.add_paragraph()
+        spacer.paragraph_format.space_before = Pt(2)
+        spacer.paragraph_format.space_after = Pt(4)
+
     def add_table_from_grid(
         self,
         grid: TableGrid,
@@ -295,12 +392,13 @@ class DocxBuilder:
     ):
         """
         Convert a TableGrid into a formatted Word Table,
-        properly applying rowspan/colspan merging and cell formatting.
+        properly applying rowspan/colspan merging, intelligent column widths,
+        cantSplit, repeat headers (tblHeader), and cell padding.
         """
         if grid.is_empty():
             return
 
-        # Special handling for 1x1 callout boxes when box_style is 'quote' or 'plain'
+        # Special handling for 1x1 callout boxes
         if grid.num_rows == 1 and grid.num_cols == 1:
             raw_text = grid.grid[0][0]
             if box_style == "plain":
@@ -308,16 +406,61 @@ class DocxBuilder:
                 for line in lines:
                     self.add_markdown_paragraph(line.strip(), base_dir=base_dir)
                 return
-            elif box_style == "quote":
-                lines = raw_text.split("<br>")
-                quote_md = "\n".join(f"> {line.strip()}" for line in lines if line.strip())
-                self.add_markdown_paragraph(quote_md, base_dir=base_dir)
+            elif box_style in ("quote", "callout", "table"):
+                self._add_callout_box(raw_text, base_dir=base_dir)
                 return
 
         # Create table
         table = self.doc.add_table(rows=grid.num_rows, cols=grid.num_cols)
         table.style = "Table Grid"
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+
+        # Set table cell padding (margins) across the table
+        tblPr = table._tbl.tblPr
+        tblCellMar = (
+            f'<w:tblCellMar xmlns:w="{W_NS}">'
+            f'  <w:top w:w="80" w:type="dxa"/>'
+            f'  <w:left w:w="120" w:type="dxa"/>'
+            f'  <w:bottom w:w="80" w:type="dxa"/>'
+            f'  <w:right w:w="120" w:type="dxa"/>'
+            f'</w:tblCellMar>'
+        )
+        tblPr.append(parse_xml(tblCellMar))
+
+        # Calculate proportional column widths
+        total_avail_width_inches = 6.8  # Default page width minus margins
+        col_text_weights = [1 for _ in range(grid.num_cols)]
+        for r in range(grid.num_rows):
+            for c in range(grid.num_cols):
+                w = get_east_asian_width(grid.grid[r][c])
+                if w > col_text_weights[c]:
+                    col_text_weights[c] = min(w, 80)
+
+        total_weight = sum(col_text_weights) or 1
+        col_widths_inches = []
+        for weight in col_text_weights:
+            calc_w = (weight / total_weight) * total_avail_width_inches
+            col_widths_inches.append(max(0.3, calc_w))
+
+        # Normalize column widths to fit total_avail_width
+        norm_sum = sum(col_widths_inches)
+        if norm_sum > 0:
+            col_widths_inches = [(w / norm_sum) * total_avail_width_inches for w in col_widths_inches]
+
+        # Apply column widths to cells
+        for r_idx, row in enumerate(table.rows):
+            # cantSplit: prevent row breaking across pages
+            trPr = row._tr.get_or_add_trPr()
+            trPr.append(parse_xml(f'<w:cantSplit xmlns:w="{W_NS}"/>'))
+
+            # tblHeader: repeat header row on subsequent pages
+            if r_idx == 0 and grid.num_rows > 1:
+                trPr.append(parse_xml(f'<w:tblHeader xmlns:w="{W_NS}"/>'))
+
+            for c_idx, cell in enumerate(row.cells):
+                if c_idx < len(col_widths_inches):
+                    cell.width = Inches(col_widths_inches[c_idx])
 
         # Perform cell merges based on cells_info
         for r, c, row_span, col_span, _ in grid.cells_info:
