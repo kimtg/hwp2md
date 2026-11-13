@@ -9,6 +9,7 @@ import os
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
+from xml.sax.saxutils import escape as xml_escape
 
 try:
     import docx
@@ -83,11 +84,23 @@ def parse_inline_markdown(text: str) -> List[Tuple[str, str, Optional[str]]]:
     return tokens
 
 
+def _apply_east_asian_font(run, font_name: str = "맑은 고딕"):
+    """Set run font name and explicit East Asian font attribute in w:rPr."""
+    run.font.name = font_name
+    rPr = run.element.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+    rFonts.set(qn("w:eastAsia"), font_name)
+
+
 def add_hyperlink_to_paragraph(paragraph, url: str, text: str, color_hex: str = "1D4ED8"):
     """Insert a clickable external hyperlink into a python-docx paragraph."""
     part = paragraph.part
     try:
         r_id = part.relate_to(url, docx.opc.constants.RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+        safe_text = xml_escape(text)
         hyperlink_xml = (
             f'<w:hyperlink xmlns:w="{W_NS}" xmlns:r="{R_NS}" r:id="{r_id}">'
             f'  <w:r>'
@@ -96,7 +109,7 @@ def add_hyperlink_to_paragraph(paragraph, url: str, text: str, color_hex: str = 
             f'      <w:color w:val="{color_hex}"/>'
             f'      <w:u w:val="single"/>'
             f'    </w:rPr>'
-            f'    <w:t>{text}</w:t>'
+            f'    <w:t xml:space="preserve">{safe_text}</w:t>'
             f'  </w:r>'
             f'</w:hyperlink>'
         )
@@ -104,7 +117,7 @@ def add_hyperlink_to_paragraph(paragraph, url: str, text: str, color_hex: str = 
     except Exception:
         # Fallback to plain formatted run
         run = paragraph.add_run(f"{text} ({url})")
-        run.font.name = "맑은 고딕"
+        _apply_east_asian_font(run)
         run.underline = True
 
 
@@ -154,15 +167,7 @@ class DocxBuilder:
         p = self.doc.add_paragraph()
         run = p.add_run(text.strip())
         run.bold = True
-        run.font.name = "맑은 고딕"
-
-        # Explicit East Asian font for heading
-        rPr = run.element.get_or_add_rPr()
-        rFonts = rPr.find(qn("w:rFonts"))
-        if rFonts is None:
-            rFonts = OxmlElement("w:rFonts")
-            rPr.append(rFonts)
-        rFonts.set(qn("w:eastAsia"), "맑은 고딕")
+        _apply_east_asian_font(run)
 
         if level == 1:
             run.font.size = Pt(18)
@@ -210,6 +215,31 @@ class DocxBuilder:
             strikeout = item[3] if len(item) > 3 else False
             underline = item[4] if len(item) > 4 else False
 
+            if "](" in text and "[" in text:
+                last_pos = 0
+                for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text):
+                    if m.start() > last_pos:
+                        r = p.add_run(text[last_pos:m.start()])
+                        r.bold = bold
+                        r.italic = italic
+                        if strikeout:
+                            r.font.strike = True
+                        if underline:
+                            r.underline = True
+                        _apply_east_asian_font(r)
+                    add_hyperlink_to_paragraph(p, url=m.group(2), text=m.group(1))
+                    last_pos = m.end()
+                if last_pos < len(text):
+                    r = p.add_run(text[last_pos:])
+                    r.bold = bold
+                    r.italic = italic
+                    if strikeout:
+                        r.font.strike = True
+                    if underline:
+                        r.underline = True
+                    _apply_east_asian_font(r)
+                continue
+
             run = p.add_run(text)
             run.bold = bold
             run.italic = italic
@@ -217,7 +247,7 @@ class DocxBuilder:
                 run.font.strike = True
             if underline:
                 run.underline = True
-            run.font.name = "맑은 고딕"
+            _apply_east_asian_font(run)
 
     def add_markdown_paragraph(self, text: str, base_dir: Optional[Path] = None):
         """Add a paragraph parsed from markdown formatting (headings, quotes, bold, images)."""
@@ -266,23 +296,23 @@ class DocxBuilder:
         for token_type, content, extra in tokens:
             if token_type == "text":
                 run = paragraph.add_run(content)
-                run.font.name = "맑은 고딕"
+                _apply_east_asian_font(run)
             elif token_type == "bold":
                 run = paragraph.add_run(content)
                 run.bold = True
-                run.font.name = "맑은 고딕"
+                _apply_east_asian_font(run)
             elif token_type == "italic":
                 run = paragraph.add_run(content)
                 run.italic = True
-                run.font.name = "맑은 고딕"
+                _apply_east_asian_font(run)
             elif token_type == "strike":
                 run = paragraph.add_run(content)
                 run.font.strike = True
-                run.font.name = "맑은 고딕"
+                _apply_east_asian_font(run)
             elif token_type == "underline":
                 run = paragraph.add_run(content)
                 run.underline = True
-                run.font.name = "맑은 고딕"
+                _apply_east_asian_font(run)
             elif token_type == "link":
                 url = extra or ""
                 add_hyperlink_to_paragraph(paragraph, url=url, text=content)

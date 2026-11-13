@@ -12,6 +12,13 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
+from .formatting import (
+    FormattedRun,
+    apply_inline_formatting,
+    detect_heading_level,
+    format_paragraph_block,
+    merge_runs,
+)
 from .table_builder import TableGrid
 
 # XML Namespaces used in HWPX (KS X 6101 / OCF)
@@ -171,26 +178,62 @@ class HWPXParser:
                 blocks.append(f"<!-- Error reading section {sec_href}: {e} -->")
         return blocks
 
-    def _parse_paragraph(self, p_elem: ET.Element, zf: zipfile.ZipFile) -> str:
-        """Parse a single paragraph element, which may contain text, images, or tables."""
-        # Check if this paragraph contains a table
-        tbl = p_elem.find(".//hp:tbl", NS)
-        if tbl is not None:
-            return self._parse_table(tbl, zf)
-
-        raw_runs: List[Tuple[str, bool, bool, bool]] = []
+    def _extract_runs_and_images(
+        self, p_elem: ET.Element, zf: zipfile.ZipFile, for_docx: bool = False
+    ) -> Tuple[List[FormattedRun], List[Any], float]:
+        """Extract formatted runs (with hyperlink support), images, and max font size from <hp:p>."""
+        raw_runs: List[FormattedRun] = []
         max_font_size = 10.0
-        images: List[str] = []
+        images: List[Any] = []
+
+        active_link_url: Optional[str] = None
+        link_text_parts: List[str] = []
+        link_fmt: Optional[Tuple[bool, bool, bool, bool]] = None
+
+        def flush_link():
+            nonlocal active_link_url, link_text_parts, link_fmt
+            if active_link_url and link_text_parts:
+                link_text = "".join(link_text_parts).strip()
+                if link_text:
+                    fmt = link_fmt or (False, False, False, False)
+                    raw_runs.append((f"[{link_text}]({active_link_url})", *fmt))
+            active_link_url = None
+            link_text_parts = []
+            link_fmt = None
 
         for run in p_elem.findall("hp:run", NS):
+            # Check for hyperlink fieldBegin / fieldEnd inside <hp:ctrl>
+            for ctrl in run.findall("hp:ctrl", NS):
+                fb = ctrl.find("hp:fieldBegin", NS)
+                if fb is not None and fb.attrib.get("type") == "HYPERLINK":
+                    flush_link()
+                    url = ""
+                    for sp in fb.findall(".//hp:stringParam", NS):
+                        name = sp.attrib.get("name", "")
+                        val = (sp.text or "").strip()
+                        if name == "Path" and val:
+                            url = val
+                            break
+                        if name == "Command" and val and not url:
+                            url = val.split(";")[0].strip()
+                    if url:
+                        active_link_url = url
+                fe = ctrl.find("hp:fieldEnd", NS)
+                if fe is not None and active_link_url is not None:
+                    flush_link()
+
             # Check for embedded picture
             pic = run.find("hp:pic", NS)
             if pic is not None:
-                img_md = self._parse_picture(pic, zf)
-                if img_md:
-                    images.append(img_md)
+                if for_docx:
+                    img_path, _ = self._extract_picture_file(pic, zf)
+                    if img_path:
+                        images.append(img_path)
+                else:
+                    img_md = self._parse_picture(pic, zf)
+                    if img_md:
+                        images.append(img_md)
 
-            # Check for text in run
             char_pr_id = run.attrib.get("charPrIDRef", "")
             cp = self.char_properties.get(char_pr_id, {})
             font_size = cp.get("height", 10.0)
@@ -208,58 +251,45 @@ class HWPXParser:
                 italic = cp.get("italic", False)
                 strikeout = cp.get("strikeout", False)
                 underline = cp.get("underline", False)
-                raw_runs.append((run_text, bold, italic, strikeout, underline))
+                if active_link_url is not None:
+                    link_text_parts.append(run_text)
+                    if link_fmt is None:
+                        link_fmt = (bold, italic, strikeout, underline)
+                else:
+                    raw_runs.append((run_text, bold, italic, strikeout, underline))
 
-        # Merge adjacent runs with identical formatting for clean markdown output
-        merged_runs = self._merge_runs(raw_runs)
+        flush_link()
+        return raw_runs, images, max_font_size
+
+    def _parse_paragraph(self, p_elem: ET.Element, zf: zipfile.ZipFile) -> str:
+        """Parse a single paragraph element, which may contain text, images, or tables."""
+        tbl = p_elem.find(".//hp:tbl", NS)
+        if tbl is not None:
+            return self._parse_table(tbl, zf)
+
+        raw_runs, images, max_font_size = self._extract_runs_and_images(p_elem, zf, for_docx=False)
+        merged_runs = merge_runs(raw_runs)
 
         formatted_parts: List[str] = []
-        is_all_bold = True if merged_runs else False
+        is_all_bold = bool(merged_runs)
 
         for text, bold, italic, strikeout, underline in merged_runs:
             if not bold:
                 is_all_bold = False
-            part = self._apply_inline_formatting(
+            part = apply_inline_formatting(
                 text, bold=bold, italic=italic, strikeout=strikeout, underline=underline
             )
             formatted_parts.append(part)
 
         paragraph_text = "".join(formatted_parts).strip()
 
-        # Combine with images
         result_parts = []
         if images:
             result_parts.extend(images)
         if paragraph_text:
-            # Heading detection
-            clean_text = paragraph_text.replace("*", "").replace("~~", "").strip()
-            if max_font_size >= 18.0 and len(clean_text) < 100 and "\n" not in clean_text:
-                result_parts.append(f"# {clean_text}")
-            elif max_font_size >= 15.0 and len(clean_text) < 120 and "\n" not in clean_text:
-                result_parts.append(f"## {clean_text}")
-            elif max_font_size >= 13.0 and is_all_bold and len(clean_text) < 120 and "\n" not in clean_text:
-                result_parts.append(f"### {clean_text}")
-            else:
-                result_parts.append(paragraph_text)
+            result_parts.append(format_paragraph_block(paragraph_text, max_font_size, is_all_bold))
 
         return "\n\n".join(result_parts)
-
-    def _merge_runs(
-        self, runs: List[Tuple[str, ...]]
-    ) -> List[Tuple[str, ...]]:
-        """Merge adjacent runs that share identical formatting."""
-        merged: List[Tuple[str, ...]] = []
-        for item in runs:
-            text = item[0]
-            fmt = item[1:]
-            if not text:
-                continue
-            if merged and merged[-1][1:] == fmt:
-                prev_text = merged[-1][0]
-                merged[-1] = (prev_text + text, *fmt)
-            else:
-                merged.append((text, *fmt))
-        return merged
 
     def _extract_text_from_t(self, t_elem: ET.Element) -> str:
         """Extract text from <hp:t>, properly handling lineBreak and fwSpace."""
@@ -277,38 +307,6 @@ class HWPXParser:
             if child.tail:
                 parts.append(child.tail)
         return "".join(parts)
-
-    def _apply_inline_formatting(
-        self,
-        text: str,
-        bold: bool = False,
-        italic: bool = False,
-        strikeout: bool = False,
-        underline: bool = False,
-    ) -> str:
-        """Apply bold/italic/strikeout/underline markdown formatting preserving leading/trailing whitespace."""
-        if not text:
-            return ""
-        if not (bold or italic or strikeout or underline):
-            return text
-
-        match = re.match(r"^(\s*)(.*?)(\s*)$", text, flags=re.DOTALL)
-        if not match:
-            return text
-        leading, core, trailing = match.groups()
-        if not core:
-            return text
-
-        if underline:
-            core = f"<u>{core}</u>"
-        if strikeout:
-            core = f"~~{core}~~"
-        if bold:
-            core = f"**{core}**"
-        if italic:
-            core = f"*{core}*"
-
-        return f"{leading}{core}{trailing}"
 
     def _extract_table_grid(self, tbl_elem: ET.Element, zf: zipfile.ZipFile) -> Optional[TableGrid]:
         """Extract TableGrid from <hp:tbl> element. Returns None if nested table container."""
@@ -363,7 +361,7 @@ class HWPXParser:
         cell_lines: List[str] = []
         for p in sublist.findall("hp:p", NS):
             line_parts: List[str] = []
-            raw_runs: List[Tuple[str, bool, bool, bool]] = []
+            raw_runs: List[FormattedRun] = []
             for run in p.findall("hp:run", NS):
                 # Check for embedded picture in cell
                 pic = run.find("hp:pic", NS)
@@ -386,9 +384,9 @@ class HWPXParser:
                     underline = cp.get("underline", False)
                     raw_runs.append((run_text, bold, italic, strikeout, underline))
 
-            merged = self._merge_runs(raw_runs)
+            merged = merge_runs(raw_runs)
             for t, b, it, s, u in merged:
-                part = self._apply_inline_formatting(t, bold=b, italic=it, strikeout=s, underline=u)
+                part = apply_inline_formatting(t, bold=b, italic=it, strikeout=s, underline=u)
                 if part:
                     line_parts.append(part)
 
@@ -498,35 +496,7 @@ class HWPXParser:
                             self._render_paragraph_to_docx(sub_p, zf, builder)
             return
 
-        raw_runs: List[Tuple[str, bool, bool, bool]] = []
-        max_font_size = 10.0
-        images: List[Path] = []
-
-        for run in p_elem.findall("hp:run", NS):
-            pic = run.find("hp:pic", NS)
-            if pic is not None:
-                img_path, _ = self._extract_picture_file(pic, zf)
-                if img_path:
-                    images.append(img_path)
-
-            char_pr_id = run.attrib.get("charPrIDRef", "")
-            cp = self.char_properties.get(char_pr_id, {})
-            font_size = cp.get("height", 10.0)
-            if font_size > max_font_size:
-                max_font_size = font_size
-
-            run_text = ""
-            for t in run.findall("hp:t", NS):
-                t_str = self._extract_text_from_t(t)
-                if t_str:
-                    run_text += t_str
-
-            if run_text:
-                bold = cp.get("bold", False)
-                italic = cp.get("italic", False)
-                strikeout = cp.get("strikeout", False)
-                underline = cp.get("underline", False)
-                raw_runs.append((run_text, bold, italic, strikeout, underline))
+        raw_runs, images, max_font_size = self._extract_runs_and_images(p_elem, zf, for_docx=True)
 
         # Add images
         for img in images:
@@ -535,7 +505,7 @@ class HWPXParser:
         if not raw_runs:
             return
 
-        merged_runs = self._merge_runs(raw_runs)
+        merged_runs = merge_runs(raw_runs)
         is_all_bold = all(item[1] for item in merged_runs)
         clean_text = "".join(item[0] for item in merged_runs).strip()
 
@@ -543,12 +513,9 @@ class HWPXParser:
             return
 
         # Heading detection
-        if max_font_size >= 18.0 and len(clean_text) < 100 and "\n" not in clean_text:
-            builder.add_heading(clean_text, level=1)
-        elif max_font_size >= 15.0 and len(clean_text) < 120 and "\n" not in clean_text:
-            builder.add_heading(clean_text, level=2)
-        elif max_font_size >= 13.0 and is_all_bold and len(clean_text) < 120 and "\n" not in clean_text:
-            builder.add_heading(clean_text, level=3)
+        level = detect_heading_level(clean_text, max_font_size, is_all_bold)
+        if level is not None:
+            builder.add_heading(clean_text, level=level)
         else:
             builder.add_paragraph_runs(merged_runs)
 

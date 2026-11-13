@@ -4,6 +4,7 @@ or HTML tables with proper span handling and column alignment.
 """
 
 from __future__ import annotations
+import html
 import unicodedata
 from typing import List, Tuple, Optional
 
@@ -83,6 +84,7 @@ class TableGrid:
         clean = sanitize_cell_text(text)
         self.grid[row][col] = clean
         self.occupied[row][col] = True
+        self.cells_info = [item for item in self.cells_info if not (item[0] == row and item[1] == col)]
         self.cells_info.append((row, col, row_span, col_span, clean))
 
         # Mark all positions covered by this cell's span
@@ -180,8 +182,11 @@ class TableGrid:
                     if cs > 1:
                         attrs.append(f'colspan="{cs}"')
                     attr_str = (" " + " ".join(attrs)) if attrs else ""
-                    # Unescape pipe for HTML
-                    html_content = text.replace("\\|", "|")
+                    # Unescape pipe and HTML-escape cell content while preserving <br> line breaks
+                    raw_content = text.replace("\\|", "|")
+                    html_content = "<br>".join(
+                        html.escape(part, quote=False) for part in raw_content.split("<br>")
+                    )
                     lines.append(f"    <td{attr_str}>{html_content}</td>")
             lines.append("  </tr>")
         lines.append("</table>")

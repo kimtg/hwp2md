@@ -5,12 +5,47 @@ and document metadata inspection.
 """
 
 from __future__ import annotations
+import datetime
 import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, Any, Optional, Union
+
+_ZIP_MAGIC = b"PK\x03\x04"
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+_HWP_PROP_MAP = {
+    2: "title",
+    3: "subject",
+    4: "creator",
+    5: "keywords",
+    6: "comments",
+    8: "last_saved_by",
+    12: "created_at",
+    13: "modified_at",
+    20: "date",
+}
+
+
+def _decode_ole_prop(value: Any) -> Optional[str]:
+    """Decode an OLE property value (str, bytes, or datetime) to clean string."""
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        for enc in ("utf-16-le", "utf-8", "cp949"):
+            try:
+                decoded = value.decode(enc).rstrip("\x00").strip()
+                if decoded:
+                    return decoded
+            except Exception:
+                continue
+        return None
+    s = str(value).strip()
+    return s if s else None
 
 # Regex patterns for stripping markdown syntax
 RE_IMAGE = re.compile(r"!\[(.*?)\]\(.*?\)")
@@ -87,14 +122,23 @@ def extract_metadata(file_path: Union[str, Path]) -> Dict[str, Any]:
         raise FileNotFoundError(f"File not found: {path}")
 
     stat = path.stat()
+    ext = path.suffix.lower()
+    fmt = ext.lstrip(".")
+    if ext not in (".hwpx", ".hwp"):
+        with open(path, "rb") as f:
+            header = f.read(8)
+        if header.startswith(_ZIP_MAGIC):
+            fmt = "hwpx"
+        elif header.startswith(_OLE_MAGIC):
+            fmt = "hwp"
+
     meta: Dict[str, Any] = {
         "filename": path.name,
         "filesize_bytes": stat.st_size,
-        "format": path.suffix.lower().lstrip("."),
+        "format": fmt,
     }
 
-    ext = path.suffix.lower()
-    if ext == ".hwpx":
+    if fmt == "hwpx":
         try:
             with zipfile.ZipFile(path, "r") as zf:
                 # Count sections and images
@@ -120,7 +164,7 @@ def extract_metadata(file_path: Union[str, Path]) -> Dict[str, Any]:
                         pass
         except Exception as e:
             meta["error"] = str(e)
-    elif ext == ".hwp":
+    elif fmt == "hwp":
         try:
             import olefile
             if olefile.isOleFile(str(path)):
@@ -129,11 +173,22 @@ def extract_metadata(file_path: Union[str, Path]) -> Dict[str, Any]:
                     meta["ole_streams_count"] = len(streams)
                     bindata_streams = [s for s in streams if s[0] == "BinData"]
                     meta["embedded_images_count"] = len(bindata_streams)
+                    section_streams = [s for s in streams if s[0] == "BodyText" and len(s) > 1 and s[1].startswith("Section")]
+                    if section_streams:
+                        meta["section_count"] = len(section_streams)
 
                     # Read SummaryInformation if exists
                     if ole.exists("\x05HwpSummaryInformation"):
-                        pass
-        except Exception:
-            pass
+                        try:
+                            props = ole.getproperties("\x05HwpSummaryInformation")
+                            for prop_id, key in _HWP_PROP_MAP.items():
+                                if prop_id in props:
+                                    val = _decode_ole_prop(props[prop_id])
+                                    if val:
+                                        meta[key] = val
+                        except Exception:
+                            pass
+        except Exception as e:
+            meta["error"] = str(e)
 
     return meta

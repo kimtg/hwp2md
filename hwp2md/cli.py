@@ -161,6 +161,16 @@ def collect_files(input_patterns: List[str], recursive: bool = False) -> List[Pa
     return matched_files
 
 
+def _safe_symbol(symbol: str, fallback: str) -> str:
+    """Return symbol if stdout encoding supports it, otherwise ASCII fallback."""
+    enc = sys.stdout.encoding or "utf-8"
+    try:
+        symbol.encode(enc)
+        return symbol
+    except (UnicodeEncodeError, LookupError):
+        return fallback
+
+
 def run_cli(args: List[str] = None, default_mode: str = "md") -> int:
     parsed = parse_args(args, default_mode=default_mode)
     files = collect_files(parsed.inputs, recursive=parsed.recursive)
@@ -207,7 +217,13 @@ def run_cli(args: List[str] = None, default_mode: str = "md") -> int:
                 out_path = None
             elif parsed.output:
                 out_p = Path(parsed.output)
-                if out_p.is_dir() or len(files) > 1:
+                is_out_dir = (
+                    out_p.is_dir()
+                    or len(files) > 1
+                    or str(parsed.output).endswith(("/", "\\"))
+                    or not out_p.suffix
+                )
+                if is_out_dir:
                     out_p.mkdir(parents=True, exist_ok=True)
                     out_path = out_p / f"{file_path.stem}{target_ext}"
                 else:
@@ -230,10 +246,12 @@ def run_cli(args: List[str] = None, default_mode: str = "md") -> int:
                 sys.stdout.write(str(result))
             else:
                 dest_name = out_path.name if out_path else str(result)
-                print(f"{prefix}[✓] Converted: {file_path.name} -> {dest_name}")
+                ok_sym = _safe_symbol("✓", "OK")
+                print(f"{prefix}[{ok_sym}] Converted: {file_path.name} -> {dest_name}")
             success_count += 1
         except Exception as e:
-            print(f"{prefix}[✗] Failed to convert {file_path.name}: {e}", file=sys.stderr)
+            err_sym = _safe_symbol("✗", "ERR")
+            print(f"{prefix}[{err_sym}] Failed to convert {file_path.name}: {e}", file=sys.stderr)
             fail_count += 1
 
     if not parsed.stdout and len(files) > 1:
